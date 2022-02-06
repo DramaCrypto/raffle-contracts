@@ -816,12 +816,10 @@ interface ICliffRaffle {
     /**
      * @notice Draw the final number, calculate reward in CLIFF per group, and make lottery claimable
      * @param _lotteryId: lottery id
-     * @param _autoInjection: reinjects funds into next lottery (vs. withdrawing all)
      * @dev Callable by operator
      */
     function drawFinalNumberAndMakeLotteryClaimable(
-        uint256 _lotteryId,
-        bool _autoInjection
+        uint256 _lotteryId
     ) external;
 
     /**
@@ -835,16 +833,14 @@ interface ICliffRaffle {
     /**
      * @notice Start the lottery
      * @dev Callable by operator
-     * @param _endTime: endTime of the lottery
      * @param _priceTicketInCliff: price of a ticket in CLIFF
      * @param _discountDivisor: the divisor to calculate the discount magnitude for bulks
-     * @param _rewardsBreakdown: breakdown of rewards per winner including treasury fee (must sum to 10,000)
+     * @param _rewardsBreakdown: breakdown of rewards per winner, treasury fee and roll over (must sum to 10,000)
      */
     function startLottery(
-        uint256 _endTime,
         uint256 _priceTicketInCliff,
         uint256 _discountDivisor,
-        uint256[4] calldata _rewardsBreakdown
+        uint256[5] calldata _rewardsBreakdown
     ) external;
 
     /**
@@ -852,7 +848,6 @@ interface ICliffRaffle {
      */
     function viewCurrentLotteryId() external returns (uint256);
 }
-
 
 // File: contracts/RandomNumberGenerator.sol
 
