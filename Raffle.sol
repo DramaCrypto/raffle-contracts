@@ -366,6 +366,11 @@ interface IERC20 {
     function totalSupply() external view returns (uint256);
 
     /**
+     * @dev Returns the token decimals.
+     */
+    function decimals() external view returns (uint8);
+
+    /**
      * @dev Returns the amount of tokens owned by `account`.
      */
     function balanceOf(address account) external view returns (uint256);
@@ -848,34 +853,6 @@ interface IRandomNumberGenerator {
     function viewRandomResult() external view returns (uint256);
 }
 
-pragma solidity ^0.8.4;
-
-interface IRafflePool {
-    /**
-     * View user info in the pool
-     */
-    function userInfo(address account)
-        external
-        view
-        returns (
-            uint256,
-            uint256,
-            uint256
-        );
-
-    function pendingReward(address _user) external view returns (uint256);
-
-    /**
-     * Stake token into the pool
-     */
-    function deposit(uint256 amount) external;
-
-    /**
-     * Withdraw from the pool
-     */
-    function withdraw(uint256 amount) external;
-}
-
 // File: contracts/interfaces/ICliffRaffle.sol
 
 pragma solidity ^0.8.4;
@@ -908,12 +885,10 @@ interface ICliffRaffle {
     /**
      * @notice Draw the final number, calculate reward in CLIFF per group, and make lottery claimable
      * @param _lotteryId: lottery id
-     * @param _autoInjection: reinjects funds into next lottery (vs. withdrawing all)
      * @dev Callable by operator
      */
     function drawFinalNumberAndMakeLotteryClaimable(
-        uint256 _lotteryId,
-        bool _autoInjection
+        uint256 _lotteryId
     ) external;
 
     /**
@@ -927,16 +902,14 @@ interface ICliffRaffle {
     /**
      * @notice Start the lottery
      * @dev Callable by operator
-     * @param _endTime: endTime of the lottery
      * @param _priceTicketInCliff: price of a ticket in CLIFF
      * @param _discountDivisor: the divisor to calculate the discount magnitude for bulks
-     * @param _rewardsBreakdown: breakdown of rewards per winner including treasury fee (must sum to 10,000)
+     * @param _rewardsBreakdown: breakdown of rewards per winner, treasury fee and roll over (must sum to 10,000)
      */
     function startLottery(
-        uint256 _endTime,
         uint256 _priceTicketInCliff,
         uint256 _discountDivisor,
-        uint256[4] calldata _rewardsBreakdown
+        uint256[5] calldata _rewardsBreakdown
     ) external;
 
     /**
@@ -973,13 +946,10 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
     uint256 public pendingInjectionNextLottery;
 
     uint256 public constant MIN_DISCOUNT_DIVISOR = 300;
-    uint256 public constant MIN_LENGTH_LOTTERY = 5 minutes; // 2 hours
-    uint256 public constant MAX_LENGTH_LOTTERY = 4 days + 5 minutes; // 4 days
     uint256 public constant MAX_TREASURY_FEE = 5000; // 50%
 
     IERC20 public cliffToken;
     IRandomNumberGenerator public randomGenerator;
-    IRafflePool public rafflePool;
 
     enum Status {
         Pending,
@@ -994,7 +964,7 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
         uint256 endTime;
         uint256 priceTicketInCliff;
         uint256 discountDivisor;
-        uint256[4] rewardsBreakdown;
+        uint256[5] rewardsBreakdown; // [0-2] for winners, [3] for burn pool, [4] for roll over
         uint256[3] winTicketIds;
         uint8 winnerCount;
         uint256 firstTicketId;
@@ -1044,7 +1014,6 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
     event LotteryOpen(
         uint256 indexed lotteryId,
         uint256 startTime,
-        uint256 endTime,
         uint256 priceTicketInCliff,
         uint256 firstTicketId,
         uint256 injectedAmount
@@ -1063,7 +1032,6 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
         address injector
     );
     event NewRandomGenerator(address indexed randomGenerator);
-    event NewRafflePool(address indexed rafflePool);
     event TicketsPurchase(
         address indexed buyer,
         uint256 indexed lotteryId,
@@ -1081,30 +1049,13 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
      * @dev RandomNumberGenerator must be deployed prior to this contract
      * @param _cliffTokenAddress: address of the CLIFF token
      * @param _randomGeneratorAddress: address of the RandomGenerator contract used to work with ChainLink VRF
-     * @param _rafflePoolAddress: address of the raffle pool contract used to stake paid tokens
      */
-    constructor(
-        address _cliffTokenAddress,
-        address _randomGeneratorAddress,
-        address _rafflePoolAddress
-    ) {
+    constructor(address _cliffTokenAddress, address _randomGeneratorAddress) {
         cliffToken = IERC20(_cliffTokenAddress);
         randomGenerator = IRandomNumberGenerator(_randomGeneratorAddress);
-        rafflePool = IRafflePool(_rafflePoolAddress);
-    }
 
-    /**
-     * @notice Stake tokens to the raffle pool
-     * @param amount: amount of tokens
-     * @return harvested rewards amount
-     */
-    function stakeToRafflePool(uint256 amount) internal returns (uint256) {
-        if (address(rafflePool) != address(0)) {
-            uint256 balanceBefore = cliffToken.balanceOf(address(this));
-            rafflePool.deposit(amount);
-            amount = cliffToken.balanceOf(address(this)).sub(balanceBefore);
-        }
-        return amount;
+        maxPriceTicketInCliff = 50 * 10**uint256(cliffToken.decimals());
+        minPriceTicketInCliff = 5 * 10**(uint256(cliffToken.decimals()).sub(3));
     }
 
     /**
@@ -1124,14 +1075,9 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
             _ticketCount <= maxNumberTicketsPerBuyOrClaim,
             "Too many tickets"
         );
-
         require(
             _lotteries[_lotteryId].status == Status.Open,
             "Lottery is not open"
-        );
-        require(
-            block.timestamp < _lotteries[_lotteryId].endTime,
-            "Lottery is over"
         );
 
         // Calculate number of CLIFF to this contract
@@ -1151,11 +1097,6 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
         amountCliffToTransfer = cliffToken.balanceOf(address(this)).sub(
             balanceBefore
         );
-
-        // Stake CLIFF tokens to raffle pool
-        // There would be reward harvested from the raffle pool at this time, so
-        // add it to the round
-        amountCliffToTransfer = stakeToRafflePool(amountCliffToTransfer);
 
         // Increment the total amount collected for the lottery round
         _lotteries[_lotteryId].amountCollectedInCliff = _lotteries[_lotteryId]
@@ -1260,10 +1201,7 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
             _lotteries[_lotteryId].status == Status.Open,
             "Lottery not open"
         );
-        require(
-            block.timestamp > _lotteries[_lotteryId].endTime,
-            "Lottery not over"
-        );
+        _lotteries[_lotteryId].endTime = block.timestamp;
         _lotteries[_lotteryId].firstTicketIdNextLottery = currentTicketId;
 
         // Request a random number from the generator based on a seed
@@ -1358,27 +1296,21 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
      * @notice Process treasury fee and the pending funds
      * @dev This function should be called only when drawing final number
      * @param _lotteryId: lottery id
-     * @param _autoInjection: reinjects funds into next lottery (vs. withdrawing all)
      * @param _winnerCount: winner count in the lottery
      */
     function processTreasuryFeeAndPendingFunds(
         uint256 _lotteryId,
-        bool _autoInjection,
         uint8 _winnerCount
     ) internal {
-        // Initializes the amount to withdraw to treasury and share to winners
-        // Just duplicate functions to avoid remaining tokens in the contract
-        uint256 amountToWithdrawToTreasury;
-
         if (_winnerCount == 2) {
             // Third rewards breakdown will be sent to treasury or auto-injected
-            amountToWithdrawToTreasury = _lotteries[_lotteryId]
+            pendingInjectionNextLottery = _lotteries[_lotteryId]
                 .amountCollectedInCliff
                 .mul(_lotteries[_lotteryId].rewardsBreakdown[2])
                 .div(10000);
         } else if (_winnerCount == 1) {
             // Second & third rewards breakdown will be sent to treasury or auto-injected
-            amountToWithdrawToTreasury = _lotteries[_lotteryId]
+            pendingInjectionNextLottery = _lotteries[_lotteryId]
                 .amountCollectedInCliff
                 .mul(
                     _lotteries[_lotteryId].rewardsBreakdown[1].add(
@@ -1388,17 +1320,17 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
                 .div(10000);
         }
 
-        if (_autoInjection) {
-            pendingInjectionNextLottery = amountToWithdrawToTreasury;
-            amountToWithdrawToTreasury = 0;
-        }
-
-        amountToWithdrawToTreasury = amountToWithdrawToTreasury.add(
+        pendingInjectionNextLottery = pendingInjectionNextLottery.add(
             _lotteries[_lotteryId]
                 .amountCollectedInCliff
-                .mul(_lotteries[_lotteryId].rewardsBreakdown[3])
+                .mul(_lotteries[_lotteryId].rewardsBreakdown[4])
                 .div(10000)
         );
+
+        uint256 amountToWithdrawToTreasury = _lotteries[_lotteryId]
+            .amountCollectedInCliff
+            .mul(_lotteries[_lotteryId].rewardsBreakdown[3])
+            .div(10000);
 
         // Transfer CLIFF to treasury address
         if (amountToWithdrawToTreasury > 0) {
@@ -1412,13 +1344,14 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
     /**
      * @notice Draw the final number, calculate reward in CLIFF per group, and make lottery claimable
      * @param _lotteryId: lottery id
-     * @param _autoInjection: reinjects funds into next lottery (vs. withdrawing all)
      * @dev Callable by operator
      */
-    function drawFinalNumberAndMakeLotteryClaimable(
-        uint256 _lotteryId,
-        bool _autoInjection
-    ) external override onlyOperator nonReentrant {
+    function drawFinalNumberAndMakeLotteryClaimable(uint256 _lotteryId)
+        external
+        override
+        onlyOperator
+        nonReentrant
+    {
         require(
             _lotteries[_lotteryId].status == Status.Close,
             "Lottery not close"
@@ -1427,19 +1360,6 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
             _lotteryId == randomGenerator.viewLatestLotteryId(),
             "Numbers not drawn"
         );
-
-        // Withdraw from the raffle pool
-        if (address(rafflePool) != address(0)) {
-            uint256 balanceBefore = cliffToken.balanceOf(address(this));
-            (uint256 amount, , ) = rafflePool.userInfo(address(this));
-            rafflePool.withdraw(amount);
-            uint256 withdrawnAmount = cliffToken.balanceOf(address(this)).sub(
-                balanceBefore
-            );
-            _lotteries[_lotteryId].amountCollectedInCliff = _lotteries[
-                _lotteryId
-            ].amountCollectedInCliff.add(withdrawnAmount);
-        }
 
         // Calculate the finalNumber based on the randomResult generated by ChainLink's fallback
         uint256 finalNumber = randomGenerator.viewRandomResult();
@@ -1450,11 +1370,7 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
             uint256 winTicketId3
         ) = determineWinTicketIdsAndCount(_lotteryId, finalNumber);
 
-        processTreasuryFeeAndPendingFunds(
-            _lotteryId,
-            _autoInjection,
-            winnerCount
-        );
+        processTreasuryFeeAndPendingFunds(_lotteryId, winnerCount);
 
         // Update internal statuses for lottery
         _lotteries[_lotteryId].winnerCount = winnerCount;
@@ -1506,23 +1422,6 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
     }
 
     /**
-     * @notice Change the random generator
-     * @dev The calls to functions are used to change raffle pool
-     * Callable only by the contract owner
-     * @param _rafflePoolAddress: address of the raffle pool
-     */
-    function changeRafflePool(address _rafflePoolAddress) external onlyOwner {
-        require(
-            _lotteries[currentLotteryId].status == Status.Claimable,
-            "Lottery not in claimable"
-        );
-
-        rafflePool = IRafflePool(_rafflePoolAddress);
-
-        emit NewRafflePool(_rafflePoolAddress);
-    }
-
-    /**
      * @notice Inject funds
      * @param _lotteryId: lottery id
      * @param _amount: amount to inject in CLIFF token
@@ -1545,42 +1444,28 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
             _amount
         );
         _amount = cliffToken.balanceOf(address(this)).sub(balanceBefore);
-
-        emit LotteryInjection(_lotteryId, _amount);
-
-        // Stake injected funds to the raffle pool, and
-        // add harvested rewards to the round
-        _amount = stakeToRafflePool(_amount);
-
         _lotteries[_lotteryId].amountCollectedInCliff = _lotteries[_lotteryId]
             .amountCollectedInCliff
             .add(_amount);
+        emit LotteryInjection(_lotteryId, _amount);
     }
 
     /**
      * @notice Start the lottery
      * @dev Callable by operator
-     * @param _endTime: endTime of the lottery
      * @param _priceTicketInCliff: price of a ticket in CLIFF
      * @param _discountDivisor: the divisor to calculate the discount magnitude for bulks
-     * @param _rewardsBreakdown: breakdown of rewards per bracket including treasury fee (must sum to 10,000)
+     * @param _rewardsBreakdown: breakdown of rewards per winner, treasury fee and roll over (must sum to 10,000)
      */
     function startLottery(
-        uint256 _endTime,
         uint256 _priceTicketInCliff,
         uint256 _discountDivisor,
-        uint256[4] calldata _rewardsBreakdown
+        uint256[5] calldata _rewardsBreakdown
     ) external override onlyOperator {
         require(
             (currentLotteryId == 0) ||
                 (_lotteries[currentLotteryId].status == Status.Claimable),
             "Not time to start lottery"
-        );
-
-        require(
-            ((_endTime - block.timestamp) > MIN_LENGTH_LOTTERY) &&
-                ((_endTime - block.timestamp) < MAX_LENGTH_LOTTERY),
-            "Lottery length outside of range"
         );
 
         require(
@@ -1602,21 +1487,17 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
             (_rewardsBreakdown[0] +
                 _rewardsBreakdown[1] +
                 _rewardsBreakdown[2] +
-                _rewardsBreakdown[3]) == 10000,
+                _rewardsBreakdown[3] +
+                _rewardsBreakdown[4]) == 10000,
             "Rewards must equal 10000"
         );
 
         currentLotteryId++;
 
-        // Stake pending injection tokens to the raffle pool
-        pendingInjectionNextLottery = stakeToRafflePool(
-            pendingInjectionNextLottery
-        );
-
         _lotteries[currentLotteryId] = Lottery({
             status: Status.Open,
             startTime: block.timestamp,
-            endTime: _endTime,
+            endTime: block.timestamp,
             priceTicketInCliff: _priceTicketInCliff,
             discountDivisor: _discountDivisor,
             rewardsBreakdown: _rewardsBreakdown,
@@ -1631,7 +1512,6 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
         emit LotteryOpen(
             currentLotteryId,
             block.timestamp,
-            _endTime,
             _priceTicketInCliff,
             currentTicketId,
             pendingInjectionNextLottery
@@ -1751,25 +1631,13 @@ contract CliffRaffle is ReentrancyGuard, ICliffRaffle, Ownable {
      * @notice View lottery information
      * @param _lotteryId: lottery id
      * @return Lottery info
-     * @return staked amount in raffle pool
-     * @return reward amount pending in raffle pool
      */
     function viewLottery(uint256 _lotteryId)
         external
         view
-        returns (
-            Lottery memory,
-            uint256,
-            uint256
-        )
+        returns (Lottery memory)
     {
-        if (address(rafflePool) != address(0)) {
-            return (_lotteries[_lotteryId], 0, 0);
-        }
-
-        (uint256 amount, , ) = rafflePool.userInfo(address(this));
-        uint256 pendingReward = rafflePool.pendingReward(address(this));
-        return (_lotteries[_lotteryId], amount, pendingReward);
+        return _lotteries[_lotteryId];
     }
 
     /**
